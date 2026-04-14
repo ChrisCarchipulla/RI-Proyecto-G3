@@ -1,0 +1,21 @@
+# RI-Proyecto-G3 - Global .gitignore for ESP-IDF (C) monorepo
+
+# Build outputs and generated component artifacts
+**/build/
+**/managed_components/
+
+# IDE workspace settings (local only)
+**/.vscode/
+
+# ESP-IDF dependency lock generated per app
+**/dependencies.lock
+
+# ESP-IDF runtime configuration (keep only defaults template)
+**/sdkconfig
+**/sdkconfig.*
+!**/sdkconfig.defaults
+
+# Compiled binaries and linker outputs
+**/*.elf
+**/*.bin
+**/*.map
