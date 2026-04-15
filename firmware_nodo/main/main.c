@@ -5,26 +5,30 @@
 #include <inttypes.h>
 #include <sys/time.h>
 #include <time.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
-#include "driver/i2c_master.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_ip_addr.h"
+#include "esp_now.h"
+#include "esp_sleep.h"
 #include "esp_sntp.h"
 #include "esp_wifi.h"
 #include "led_strip.h"
 #include "nvs_flash.h"
+
+#include "mpu6050.h"
 
 #define RGB_LED_GPIO                    8
 #define RGB_LED_COUNT                   1
 #define LED_BRIGHTNESS                  32
 #define LED_BLINK_DELAY_MS              180
 
-/* WARNING: Quick test credentials. Avoid committing real credentials to a public repository. */
+/* ADVERTENCIA: Credenciales de prueba rapida. Evitar credenciales reales en repositorios publicos. */
 #define WIFI_STA_SSID                   "GONET_GLADYS"
 #define WIFI_STA_PASSWORD               "Gladys-Loma-76."
 #define WIFI_MAXIMUM_RETRY              10
@@ -32,49 +36,36 @@
 #define WIFI_CONNECTED_BIT              BIT0
 #define WIFI_FAIL_BIT                   BIT1
 
-#define I2C_SDA_GPIO                    6
-#define I2C_SCL_GPIO                    7
-#define I2C_PORT_NUM                    0
-#define I2C_CLK_HZ                      400000
-#define I2C_XFER_TIMEOUT_MS             100
+#define NODE_ID                         1
+#define ESPNOW_CHANNEL                  1
+#define ESPNOW_POST_SEND_DELAY_MS       100
+#define DEEP_SLEEP_SECONDS              10
+#define VALID_EPOCH_2024                1704067200
 
-#define MPU6050_I2C_ADDR                0x69
-#define MPU6050_WHO_AM_I_REG            0x75
-#define MPU6050_PWR_MGMT_1_REG          0x6B
-#define MPU6050_ACCEL_CONFIG_REG        0x1C
-#define MPU6050_GYRO_CONFIG_REG         0x1B
-#define MPU6050_ACCEL_XOUT_H_REG        0x3B
-
-#define MPU6050_WHO_AM_I_EXPECTED       0x68
-
-#define MPU6050_ACCEL_SCALE_2G          16384.0f
-#define MPU6050_GYRO_SCALE_250DPS       131.0f
-
-#define SENSOR_TASK_PERIOD_MS           500
-#define SENSOR_TASK_STACK_SIZE          4096
-#define SENSOR_TASK_PRIORITY            5
+static const uint8_t s_peer_mac[ESP_NOW_ETH_ALEN] = {0x40, 0x4C, 0xCA, 0x55, 0xAB, 0x10};
 
 static const char *TAG = "NODO_SENSOR";
 
 static led_strip_handle_t s_led_strip = NULL;
-static i2c_master_bus_handle_t s_i2c_bus = NULL;
-static i2c_master_dev_handle_t s_mpu_dev = NULL;
 static EventGroupHandle_t s_wifi_event_group = NULL;
 static int s_wifi_retry_num = 0;
 
-typedef struct {
+// Estructura empaquetada para garantizar el formato binario exacto al enviar por ESP-NOW.
+typedef struct __attribute__((packed)) {
+    uint8_t id_nodo;
+    int64_t timestamp_ms;
     float accel_x_g;
     float accel_y_g;
     float accel_z_g;
     float gyro_x_dps;
     float gyro_y_dps;
     float gyro_z_dps;
-} mpu6050_sample_t;
+} sensor_data_t;
 
 /**
- * @brief Initialize the integrated RGB LED strip device.
+ * @brief Inicializa el dispositivo RGB integrado.
  *
- * @return esp_err_t ESP_OK on success, or an error code from the LED driver.
+ * @return esp_err_t ESP_OK en caso de exito, o un error del driver LED.
  */
 static esp_err_t init_rgb_led(void)
 {
@@ -101,12 +92,12 @@ static esp_err_t init_rgb_led(void)
 }
 
 /**
- * @brief Set the integrated RGB LED to a given color.
+ * @brief Establece el color del LED RGB integrado.
  *
- * @param red Red channel value (0-255).
- * @param green Green channel value (0-255).
- * @param blue Blue channel value (0-255).
- * @return esp_err_t ESP_OK on success, or an error code if LED is not initialized or refresh fails.
+ * @param red Intensidad del canal rojo (0-255).
+ * @param green Intensidad del canal verde (0-255).
+ * @param blue Intensidad del canal azul (0-255).
+ * @return esp_err_t ESP_OK si se actualizo correctamente, o un codigo de error.
  */
 static esp_err_t set_led_color(uint8_t red, uint8_t green, uint8_t blue)
 {
@@ -125,9 +116,9 @@ static esp_err_t set_led_color(uint8_t red, uint8_t green, uint8_t blue)
 }
 
 /**
- * @brief Startup pilot LED routine that blinks the integrated RGB LED in red three times.
+ * @brief Ejecuta la rutina de arranque: LED rojo parpadea 3 veces.
  *
- * @return esp_err_t ESP_OK on success, or an error code from LED operations.
+ * @return esp_err_t ESP_OK si la rutina finaliza correctamente, o un error de LED.
  */
 static esp_err_t init_led_piloto_(void)
 {
@@ -153,9 +144,9 @@ static esp_err_t init_led_piloto_(void)
 }
 
 /**
- * @brief Execute visual startup feedback.
+ * @brief Ejecuta el feedback visual de encendido.
  *
- * @return esp_err_t ESP_OK on success, or an error code from init_led_piloto_.
+ * @return esp_err_t ESP_OK si todo fue correcto, o un error de inicializacion/LED.
  */
 static esp_err_t init_visual_feedback(void)
 {
@@ -172,13 +163,13 @@ static esp_err_t init_visual_feedback(void)
 }
 
 /**
- * @brief Handle WiFi and IP events for STA connection lifecycle.
+ * @brief Manejador de eventos WiFi/IP para la conexion STA.
  *
- * @param arg Unused callback argument.
- * @param event_base Event base identifier.
- * @param event_id Event id within the event base.
- * @param event_data Optional event payload.
- * @return void This callback does not return a value.
+ * @param arg Argumento de callback no utilizado.
+ * @param event_base Base del evento recibido.
+ * @param event_id Identificador del evento.
+ * @param event_data Datos asociados al evento.
+ * @return void Esta funcion no retorna valor.
  */
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -205,9 +196,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 }
 
 /**
- * @brief Initialize NVS subsystem required by WiFi stack.
+ * @brief Inicializa NVS, requerido por la pila de WiFi.
  *
- * @return esp_err_t ESP_OK on success, or an NVS initialization error.
+ * @return esp_err_t ESP_OK en caso de exito, o un error de NVS.
  */
 static esp_err_t init_nvs_storage(void)
 {
@@ -225,30 +216,21 @@ static esp_err_t init_nvs_storage(void)
 }
 
 /**
- * @brief Configure WiFi in Station mode and block until connected or failed.
+ * @brief Inicializa la radio WiFi en modo STA sin conectarse a un AP.
  *
- * @return esp_err_t ESP_OK when connected, or an error code on failure.
+ * @return esp_err_t ESP_OK si la radio queda lista, o un error de inicializacion.
  */
-static esp_err_t wifi_init_sta(void)
+static esp_err_t wifi_init_sta_radio_only(void)
 {
     esp_err_t err;
-    EventBits_t bits;
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    wifi_config_t wifi_config = {0};
 
     err = init_nvs_storage();
     if (err != ESP_OK) {
         return err;
     }
 
-    s_wifi_event_group = xEventGroupCreate();
-    if (s_wifi_event_group == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
     err = esp_netif_init();
-    if (err != ESP_OK) {
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         return err;
     }
 
@@ -265,6 +247,40 @@ static esp_err_t wifi_init_sta(void)
     err = esp_wifi_init(&cfg);
     if (err != ESP_OK) {
         return err;
+    }
+
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_wifi_start();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    ESP_LOGI(TAG, "WiFi STA iniciado (modo radio para ESP-NOW)");
+    return ESP_OK;
+}
+
+/**
+ * @brief Conecta la interfaz STA al AP y espera resultado.
+ *
+ * @return esp_err_t ESP_OK si conecta, o ESP_FAIL si agota reintentos.
+ */
+static esp_err_t wifi_connect_sta(void)
+{
+    esp_err_t err;
+    EventBits_t bits;
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    wifi_config_t wifi_config = {0};
+
+    if (s_wifi_event_group == NULL) {
+        s_wifi_event_group = xEventGroupCreate();
+        if (s_wifi_event_group == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     err = esp_event_handler_instance_register(WIFI_EVENT,
@@ -289,22 +305,18 @@ static esp_err_t wifi_init_sta(void)
     memcpy(wifi_config.sta.password, WIFI_STA_PASSWORD, sizeof(WIFI_STA_PASSWORD));
     wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
-    err = esp_wifi_set_mode(WIFI_MODE_STA);
-    if (err != ESP_OK) {
-        return err;
-    }
-
     err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
     if (err != ESP_OK) {
         return err;
     }
 
-    err = esp_wifi_start();
+    s_wifi_retry_num = 0;
+    err = esp_wifi_connect();
     if (err != ESP_OK) {
         return err;
     }
 
-    ESP_LOGI(TAG, "wifi_init_sta() finalizado, esperando conexion al AP...");
+    ESP_LOGI(TAG, "Esperando conexion al AP para SNTP...");
 
     bits = xEventGroupWaitBits(s_wifi_event_group,
                                WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
@@ -322,9 +334,22 @@ static esp_err_t wifi_init_sta(void)
 }
 
 /**
- * @brief Synchronize system time with SNTP using time.google.com and configure Ecuador timezone.
+ * @brief Verifica si la hora del sistema es valida (anio 2024 o posterior).
  *
- * @return esp_err_t ESP_OK on successful synchronization, or ESP_ERR_TIMEOUT when sync did not complete.
+ * @return true Si la hora actual ya es valida.
+ * @return false Si la hora aun no esta sincronizada.
+ */
+static bool is_time_valid_from_rtc(void)
+{
+    time_t now = 0;
+    time(&now);
+    return now >= VALID_EPOCH_2024;
+}
+
+/**
+ * @brief Sincroniza la hora por SNTP usando time.google.com y ajusta zona horaria.
+ *
+ * @return esp_err_t ESP_OK si sincroniza correctamente, o ESP_ERR_TIMEOUT si falla.
  */
 static esp_err_t sync_time_with_ntp(void)
 {
@@ -382,161 +407,50 @@ static esp_err_t sync_time_with_ntp(void)
 }
 
 /**
- * @brief Stop WiFi radio after SNTP sync to reduce power consumption.
+ * @brief Inicializa ESP-NOW y registra el gateway como peer.
  *
- * @return esp_err_t ESP_OK on success, or an error code from esp_wifi_stop.
+ * @return esp_err_t ESP_OK si la configuracion fue correcta, o un error de ESP-NOW.
  */
-static esp_err_t stop_wifi_for_power_save(void)
+static esp_err_t init_espnow_peer(void)
 {
-    esp_err_t err = esp_wifi_stop();
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "WiFi detenido para ahorro de energia");
+    esp_err_t err;
+    esp_now_peer_info_t peer_info = {0};
+
+    err = esp_now_init();
+    if (err != ESP_OK) {
+        return err;
     }
+
+    if (esp_now_is_peer_exist(s_peer_mac)) {
+        ESP_LOGI(TAG, "Peer ESP-NOW ya registrado");
+        return ESP_OK;
+    }
+
+    memcpy(peer_info.peer_addr, s_peer_mac, ESP_NOW_ETH_ALEN);
+    peer_info.channel = ESPNOW_CHANNEL;
+    peer_info.ifidx = WIFI_IF_STA;
+    peer_info.encrypt = false;
+
+    err = esp_now_add_peer(&peer_info);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "Peer ESP-NOW agregado: %02X:%02X:%02X:%02X:%02X:%02X (canal %d)",
+                 s_peer_mac[0],
+                 s_peer_mac[1],
+                 s_peer_mac[2],
+                 s_peer_mac[3],
+                 s_peer_mac[4],
+                 s_peer_mac[5],
+                 ESPNOW_CHANNEL);
+    }
+
     return err;
 }
 
 /**
- * @brief Initialize I2C master bus on GPIO6 (SDA) and GPIO7 (SCL).
+ * @brief Obtiene la marca de tiempo Unix Epoch en milisegundos.
  *
- * @return esp_err_t ESP_OK on success, or an error code from the I2C driver.
- */
-static esp_err_t init_i2c_bus(void)
-{
-    i2c_master_bus_config_t bus_config = {
-        .i2c_port = I2C_PORT_NUM,
-        .sda_io_num = I2C_SDA_GPIO,
-        .scl_io_num = I2C_SCL_GPIO,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .intr_priority = 0,
-        .trans_queue_depth = 0,
-        .flags = {
-            .enable_internal_pullup = 1,
-            .allow_pd = 0,
-        },
-    };
-
-    return i2c_new_master_bus(&bus_config, &s_i2c_bus);
-}
-
-/**
- * @brief Write one byte to an MPU6050 register.
- *
- * @param reg Register address.
- * @param value Byte value to write.
- * @return esp_err_t ESP_OK on success, or an I2C transfer error.
- */
-static esp_err_t mpu6050_write_reg(uint8_t reg, uint8_t value)
-{
-    uint8_t payload[2] = {reg, value};
-    return i2c_master_transmit(s_mpu_dev, payload, sizeof(payload), I2C_XFER_TIMEOUT_MS);
-}
-
-/**
- * @brief Read one or more bytes from an MPU6050 register.
- *
- * @param reg Start register address.
- * @param data Output buffer where bytes will be stored.
- * @param len Number of bytes to read.
- * @return esp_err_t ESP_OK on success, or an I2C transfer error.
- */
-static esp_err_t mpu6050_read_regs(uint8_t reg, uint8_t *data, size_t len)
-{
-    return i2c_master_transmit_receive(s_mpu_dev, &reg, 1, data, len, I2C_XFER_TIMEOUT_MS);
-}
-
-/**
- * @brief Configure MPU6050 on I2C address 0x69 and set measurement ranges.
- *
- * @return esp_err_t ESP_OK on success, or an error code from I2C configuration/validation.
- */
-static esp_err_t init_mpu6050(void)
-{
-    esp_err_t err;
-    uint8_t who_am_i = 0;
-
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = MPU6050_I2C_ADDR,
-        .scl_speed_hz = I2C_CLK_HZ,
-        .scl_wait_us = 0,
-        .flags = {
-            .disable_ack_check = 0,
-        },
-    };
-
-    err = i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_mpu_dev);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = mpu6050_read_regs(MPU6050_WHO_AM_I_REG, &who_am_i, 1);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    if (who_am_i != MPU6050_WHO_AM_I_EXPECTED) {
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-
-    err = mpu6050_write_reg(MPU6050_PWR_MGMT_1_REG, 0x00);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = mpu6050_write_reg(MPU6050_ACCEL_CONFIG_REG, 0x00);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    return mpu6050_write_reg(MPU6050_GYRO_CONFIG_REG, 0x00);
-}
-
-/**
- * @brief Read accelerometer and gyroscope sample from MPU6050.
- *
- * @param sample Output sample structure populated with converted units.
- * @return esp_err_t ESP_OK on success, or an I2C communication error.
- */
-static esp_err_t mpu6050_read_sample(mpu6050_sample_t *sample)
-{
-    uint8_t raw[14] = {0};
-    int16_t ax;
-    int16_t ay;
-    int16_t az;
-    int16_t gx;
-    int16_t gy;
-    int16_t gz;
-    esp_err_t err;
-
-    err = mpu6050_read_regs(MPU6050_ACCEL_XOUT_H_REG, raw, sizeof(raw));
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    ax = (int16_t)((raw[0] << 8) | raw[1]);
-    ay = (int16_t)((raw[2] << 8) | raw[3]);
-    az = (int16_t)((raw[4] << 8) | raw[5]);
-
-    gx = (int16_t)((raw[8] << 8) | raw[9]);
-    gy = (int16_t)((raw[10] << 8) | raw[11]);
-    gz = (int16_t)((raw[12] << 8) | raw[13]);
-
-    sample->accel_x_g = ((float)ax) / MPU6050_ACCEL_SCALE_2G;
-    sample->accel_y_g = ((float)ay) / MPU6050_ACCEL_SCALE_2G;
-    sample->accel_z_g = ((float)az) / MPU6050_ACCEL_SCALE_2G;
-
-    sample->gyro_x_dps = ((float)gx) / MPU6050_GYRO_SCALE_250DPS;
-    sample->gyro_y_dps = ((float)gy) / MPU6050_GYRO_SCALE_250DPS;
-    sample->gyro_z_dps = ((float)gz) / MPU6050_GYRO_SCALE_250DPS;
-
-    return ESP_OK;
-}
-
-/**
- * @brief Get current Unix Epoch timestamp in milliseconds.
- *
- * @return int64_t Unix Epoch time in milliseconds.
+ * @return int64_t Marca de tiempo Unix Epoch en milisegundos.
  */
 static int64_t get_unix_epoch_ms(void)
 {
@@ -546,48 +460,57 @@ static int64_t get_unix_epoch_ms(void)
 }
 
 /**
- * @brief FreeRTOS task that reads MPU6050 data every 500 ms and prints a clean log line.
+ * @brief Construye el payload empaquetado con muestra del sensor y timestamp.
  *
- * @param pvParameters Unused task parameter.
- * @return void This function does not return.
+ * @param sample Muestra leida del MPU6050.
+ * @param timestamp_ms Marca de tiempo Unix Epoch en milisegundos.
+ * @param out_payload Estructura de salida a transmitir por ESP-NOW.
+ * @return void Esta funcion no retorna valor.
  */
-static void mpu6050_task(void *pvParameters)
+static void fill_sensor_payload(const mpu6050_sample_t *sample, int64_t timestamp_ms, sensor_data_t *out_payload)
 {
-    mpu6050_sample_t sample;
-    esp_err_t err;
-    int64_t timestamp_ms;
-
-    (void)pvParameters;
-
-    while (1) {
-        err = mpu6050_read_sample(&sample);
-        if (err == ESP_OK) {
-            timestamp_ms = get_unix_epoch_ms();
-            ESP_LOGI(TAG,
-                     "TS(ms):%" PRId64 " | ACC[g] X:% .3f Y:% .3f Z:% .3f | GYR[dps] X:% .3f Y:% .3f Z:% .3f",
-                     timestamp_ms,
-                     sample.accel_x_g,
-                     sample.accel_y_g,
-                     sample.accel_z_g,
-                     sample.gyro_x_dps,
-                     sample.gyro_y_dps,
-                     sample.gyro_z_dps);
-        } else {
-            ESP_LOGE(TAG, "Lectura MPU6050 fallo: %s", esp_err_to_name(err));
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_TASK_PERIOD_MS));
-    }
+    out_payload->id_nodo = NODE_ID;
+    out_payload->timestamp_ms = timestamp_ms;
+    out_payload->accel_x_g = sample->accel_x_g;
+    out_payload->accel_y_g = sample->accel_y_g;
+    out_payload->accel_z_g = sample->accel_z_g;
+    out_payload->gyro_x_dps = sample->gyro_x_dps;
+    out_payload->gyro_y_dps = sample->gyro_y_dps;
+    out_payload->gyro_z_dps = sample->gyro_z_dps;
 }
 
 /**
- * @brief Main application entry point.
+ * @brief Configura e inicia deep sleep por 10 segundos.
  *
- * @return void This function does not return.
+ * @return void Esta funcion no retorna valor.
+ */
+static void enter_deep_sleep_10s(void)
+{
+    esp_err_t err;
+
+    err = esp_sleep_enable_timer_wakeup((uint64_t)DEEP_SLEEP_SECONDS * 1000000ULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "No se pudo configurar wakeup timer: %s", esp_err_to_name(err));
+        return;
+    }
+
+    // Punto critico: al entrar en deep sleep el chip reinicia en cada despertar.
+    ESP_LOGI(TAG, "Entrando en deep sleep por %d segundos", DEEP_SLEEP_SECONDS);
+    esp_deep_sleep_start();
+}
+
+/**
+ * @brief Punto de entrada principal de la aplicacion.
+ *
+ * @return void Esta funcion no retorna valor.
  */
 void app_main(void)
 {
     esp_err_t err;
+    mpu6050_sample_t sample;
+    sensor_data_t payload;
+    int64_t timestamp_ms;
+    bool rtc_time_valid;
 
     err = init_visual_feedback();
     if (err != ESP_OK) {
@@ -595,45 +518,89 @@ void app_main(void)
         return;
     }
 
-    err = wifi_init_sta();
+    err = wifi_init_sta_radio_only();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "wifi_init_sta() fallo: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "No se pudo inicializar WiFi STA: %s", esp_err_to_name(err));
         return;
     }
 
-    err = sync_time_with_ntp();
+    rtc_time_valid = is_time_valid_from_rtc();
+    if (!rtc_time_valid) {
+        ESP_LOGI(TAG, "Hora RTC no valida, se conectara WiFi al AP para SNTP");
+
+        err = wifi_connect_sta();
+        if (err == ESP_OK) {
+            err = sync_time_with_ntp();
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Sincronizacion NTP no completada: %s", esp_err_to_name(err));
+            }
+
+            err = esp_wifi_disconnect();
+            if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_CONNECT) {
+                ESP_LOGW(TAG, "No se pudo desconectar del AP tras SNTP: %s", esp_err_to_name(err));
+            }
+        } else {
+            ESP_LOGW(TAG, "No se pudo conectar al AP para NTP: %s", esp_err_to_name(err));
+        }
+    } else {
+        ESP_LOGI(TAG, "Hora valida detectada en RTC, se omite conexion WiFi/NTP");
+    }
+
+    err = esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Sincronizacion NTP fallo: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "No se pudo fijar canal WiFi para ESP-NOW: %s", esp_err_to_name(err));
         return;
     }
 
-    err = stop_wifi_for_power_save();
+    err = init_espnow_peer();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "No se pudo detener WiFi: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "No se pudo inicializar ESP-NOW/Peer: %s", esp_err_to_name(err));
         return;
     }
 
-    err = init_i2c_bus();
+    err = mpu6050_init();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "No se pudo inicializar I2C en SDA=%d SCL=%d: %s", I2C_SDA_GPIO, I2C_SCL_GPIO, esp_err_to_name(err));
+        ESP_LOGE(TAG, "No se pudo inicializar MPU6050: %s", esp_err_to_name(err));
         return;
     }
 
-    err = init_mpu6050();
+    err = mpu6050_read_sample(&sample);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "No se pudo configurar MPU6050 @0x%02X: %s", MPU6050_I2C_ADDR, esp_err_to_name(err));
+        ESP_LOGE(TAG, "Lectura MPU6050 fallo: %s", esp_err_to_name(err));
         return;
     }
 
-    ESP_LOGI(TAG, "MPU6050 inicializado correctamente en direccion 0x%02X", MPU6050_I2C_ADDR);
+    timestamp_ms = get_unix_epoch_ms();
+    fill_sensor_payload(&sample, timestamp_ms, &payload);
 
-    if (xTaskCreate(mpu6050_task,
-                    "mpu6050_task",
-                    SENSOR_TASK_STACK_SIZE,
-                    NULL,
-                    SENSOR_TASK_PRIORITY,
-                    NULL) != pdPASS) {
-        ESP_LOGE(TAG, "No se pudo crear la tarea de lectura MPU6050");
-        return;
+    ESP_LOGI(TAG,
+             "TS(ms):%" PRId64 " | ACC[g] X:% .3f Y:% .3f Z:% .3f | GYR[dps] X:% .3f Y:% .3f Z:% .3f",
+             payload.timestamp_ms,
+             payload.accel_x_g,
+             payload.accel_y_g,
+             payload.accel_z_g,
+             payload.gyro_x_dps,
+             payload.gyro_y_dps,
+             payload.gyro_z_dps);
+
+    err = esp_now_send(s_peer_mac, (const uint8_t *)&payload, sizeof(payload));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Fallo envio ESP-NOW: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG,
+                 "ESP-NOW enviado: nodo=%u bytes=%u destino=%02X:%02X:%02X:%02X:%02X:%02X",
+                 payload.id_nodo,
+                 (unsigned int)sizeof(payload),
+                 s_peer_mac[0],
+                 s_peer_mac[1],
+                 s_peer_mac[2],
+                 s_peer_mac[3],
+                 s_peer_mac[4],
+                 s_peer_mac[5]);
     }
+
+    vTaskDelay(pdMS_TO_TICKS(ESPNOW_POST_SEND_DELAY_MS));
+
+    // Punto critico: este sleep reduce consumo de forma drastica entre muestreos.
+    enter_deep_sleep_10s();
 }
