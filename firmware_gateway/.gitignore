@@ -1,0 +1,9 @@
+build/
+managed_components/
+.vscode/
+eim_config.toml
+
+# ESP-IDF local backups and logs
+sdkconfig.old
+sdkconfig.bak
+*.log
