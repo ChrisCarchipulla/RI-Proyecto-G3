@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <stddef.h>
 #include <sys/time.h>
 #include <time.h>
 
@@ -17,7 +18,9 @@
 #include "esp_now.h"
 #include "esp_sleep.h"
 #include "esp_sntp.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
+#include "driver/gpio.h"
 #include "led_strip.h"
 #include "nvs_flash.h"
 
@@ -26,7 +29,8 @@
 #define RGB_LED_GPIO                    8
 #define RGB_LED_COUNT                   1
 #define LED_BRIGHTNESS                  32
-#define LED_BLINK_DELAY_MS              180
+#define LED_FEEDBACK_FAST_MS            50
+#define LED_COLD_BOOT_BLINKS            3
 
 /* ADVERTENCIA: Credenciales de prueba rapida. Evitar credenciales reales en repositorios publicos. */
 #define WIFI_STA_SSID                   "GONET_GLADYS"
@@ -39,8 +43,15 @@
 #define NODE_ID                         1
 #define ESPNOW_CHANNEL                  1
 #define ESPNOW_POST_SEND_DELAY_MS       100
-#define DEEP_SLEEP_SECONDS              10
+#define ESPNOW_BATCH_MAX_SAMPLES        15
+#define ESPNOW_LOG_SAMPLE_PREVIEW_MAX   2
+#define ESPNOW_SEND_TIMEOUT_MS          500
 #define VALID_EPOCH_2024                1704067200
+#define MOTION_INT_GPIO                 GPIO_NUM_4
+#define MOTION_THRESHOLD_INIT           12
+#define MOTION_DURATION_INIT            2
+
+#define FIFO_SAMPLE_BYTES               ((uint16_t)sizeof(mpu6050_sample_t))
 
 static const uint8_t s_peer_mac[ESP_NOW_ETH_ALEN] = {0x40, 0x4C, 0xCA, 0x55, 0xAB, 0x10};
 
@@ -49,18 +60,41 @@ static const char *TAG = "NODO_SENSOR";
 static led_strip_handle_t s_led_strip = NULL;
 static EventGroupHandle_t s_wifi_event_group = NULL;
 static int s_wifi_retry_num = 0;
+static bool s_wifi_reconnect_enabled = false;
+static EventGroupHandle_t s_espnow_event_group = NULL;
+static esp_now_send_status_t s_last_send_status = ESP_NOW_SEND_FAIL;
+static bool s_espnow_send_cb_registered = false;
+RTC_DATA_ATTR static uint16_t batch_id = 0;
+
+#define ESPNOW_SEND_DONE_BIT            BIT0
 
 // Estructura empaquetada para garantizar el formato binario exacto al enviar por ESP-NOW.
 typedef struct __attribute__((packed)) {
     uint8_t id_nodo;
+    uint8_t sample_count;
+    uint16_t batch_id;
     int64_t timestamp_ms;
-    float accel_x_g;
-    float accel_y_g;
-    float accel_z_g;
-    float gyro_x_dps;
-    float gyro_y_dps;
-    float gyro_z_dps;
+    mpu6050_sample_t samples[ESPNOW_BATCH_MAX_SAMPLES];
 } sensor_data_t;
+
+typedef struct {
+    int16_t ax;
+    int16_t ay;
+    int16_t az;
+    int16_t gx;
+    int16_t gy;
+    int16_t gz;
+} mpu_sample_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t id_nodo;
+    int64_t start_timestamp;
+    uint16_t batch_id;
+    mpu_sample_t muestras[10];
+} sensor_packet_t;
+
+#define STREAM_SAMPLE_COUNT            10
+#define STREAM_SAMPLE_DELAY_MS         10
 
 /**
  * @brief Inicializa el dispositivo RGB integrado.
@@ -116,31 +150,51 @@ static esp_err_t set_led_color(uint8_t red, uint8_t green, uint8_t blue)
 }
 
 /**
- * @brief Ejecuta la rutina de arranque: LED rojo parpadea 3 veces.
+ * @brief Ejecuta la rutina de arranque en frio: LED violeta parpadea 3 veces en 20ms.
  *
  * @return esp_err_t ESP_OK si la rutina finaliza correctamente, o un error de LED.
  */
-static esp_err_t init_led_piloto_(void)
+static esp_err_t run_cold_boot_led_feedback(void)
 {
     esp_err_t err = ESP_OK;
 
-    for (int i = 0; i < 3; i++) {
-        err = set_led_color(LED_BRIGHTNESS, 0, 0);
+    for (int i = 0; i < LED_COLD_BOOT_BLINKS; i++) {
+        /* Violeta = rojo + azul para indicar inicializacion del nodo. */
+        err = set_led_color(LED_BRIGHTNESS, 0, LED_BRIGHTNESS);
         if (err != ESP_OK) {
             return err;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(LED_BLINK_DELAY_MS));
+        vTaskDelay(pdMS_TO_TICKS(LED_FEEDBACK_FAST_MS));
 
         err = set_led_color(0, 0, 0);
         if (err != ESP_OK) {
             return err;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(LED_BLINK_DELAY_MS));
+        vTaskDelay(pdMS_TO_TICKS(LED_FEEDBACK_FAST_MS));
     }
 
     return ESP_OK;
+}
+
+/**
+ * @brief Ejecuta feedback de despertar por movimiento: un destello verde de 20ms.
+ *
+ * @return esp_err_t ESP_OK si el destello se completa correctamente.
+ */
+static esp_err_t run_motion_wakeup_led_feedback(void)
+{
+    esp_err_t err;
+
+    err = set_led_color(0, LED_BRIGHTNESS, 0);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(LED_FEEDBACK_FAST_MS));
+
+    return set_led_color(0, 0, 0);
 }
 
 /**
@@ -159,7 +213,48 @@ static esp_err_t init_visual_feedback(void)
         }
     }
 
-    return init_led_piloto_();
+    return run_cold_boot_led_feedback();
+}
+
+/**
+ * @brief Ejecuta el feedback visual para wake-on-motion.
+ *
+ * @return esp_err_t ESP_OK si el destello finaliza correctamente.
+ */
+static esp_err_t motion_wakeup_visual_feedback(void)
+{
+    esp_err_t err;
+
+    if (s_led_strip == NULL) {
+        err = init_rgb_led();
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
+    return run_motion_wakeup_led_feedback();
+}
+
+/**
+ * @brief Callback de ESP-NOW para confirmar estado real de transmision.
+ *
+ * @param tx_info Informacion de transmision entregada por el driver.
+ * @param status Resultado final del intento de envio.
+ * @return void Esta funcion no retorna valor.
+ */
+static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
+{
+    (void)tx_info;
+
+    s_last_send_status = status;
+
+    ESP_LOGI(TAG,
+             "ESP-NOW callback: status=%s",
+             (status == ESP_NOW_SEND_SUCCESS) ? "SUCCESS" : "FAIL");
+
+    if (s_espnow_event_group != NULL) {
+        xEventGroupSetBits(s_espnow_event_group, ESPNOW_SEND_DONE_BIT);
+    }
 }
 
 /**
@@ -179,6 +274,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         ESP_LOGI(TAG, "WiFi STA iniciando conexion...");
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (!s_wifi_reconnect_enabled) {
+            ESP_LOGI(TAG, "WiFi desconectado de forma controlada, sin reintento automatico");
+            return;
+        }
+
         if (s_wifi_retry_num < WIFI_MAXIMUM_RETRY) {
             s_wifi_retry_num++;
             ESP_LOGI(TAG, "WiFi reconectando intento %d/%d", s_wifi_retry_num, WIFI_MAXIMUM_RETRY);
@@ -311,6 +411,7 @@ static esp_err_t wifi_connect_sta(void)
     }
 
     s_wifi_retry_num = 0;
+    s_wifi_reconnect_enabled = true;
     err = esp_wifi_connect();
     if (err != ESP_OK) {
         return err;
@@ -416,9 +517,24 @@ static esp_err_t init_espnow_peer(void)
     esp_err_t err;
     esp_now_peer_info_t peer_info = {0};
 
+    if (s_espnow_event_group == NULL) {
+        s_espnow_event_group = xEventGroupCreate();
+        if (s_espnow_event_group == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     err = esp_now_init();
-    if (err != ESP_OK) {
+    if (err != ESP_OK && err != ESP_ERR_ESPNOW_EXIST) {
         return err;
+    }
+
+    if (!s_espnow_send_cb_registered) {
+        err = esp_now_register_send_cb(espnow_send_cb);
+        if (err != ESP_OK) {
+            return err;
+        }
+        s_espnow_send_cb_registered = true;
     }
 
     if (esp_now_is_peer_exist(s_peer_mac)) {
@@ -460,43 +576,190 @@ static int64_t get_unix_epoch_ms(void)
 }
 
 /**
- * @brief Construye el payload empaquetado con muestra del sensor y timestamp.
+ * @brief Construye el payload empaquetado para envio por lotes (batch).
  *
- * @param sample Muestra leida del MPU6050.
+ * @param samples Arreglo de muestras crudas a transmitir.
+ * @param sample_count Cantidad de muestras validas en el arreglo.
+ * @param batch_id Identificador incremental del lote.
  * @param timestamp_ms Marca de tiempo Unix Epoch en milisegundos.
  * @param out_payload Estructura de salida a transmitir por ESP-NOW.
  * @return void Esta funcion no retorna valor.
  */
-static void fill_sensor_payload(const mpu6050_sample_t *sample, int64_t timestamp_ms, sensor_data_t *out_payload)
+static void fill_sensor_payload_batch(const mpu6050_sample_t *samples,
+                                      uint8_t sample_count,
+                                      uint16_t batch_id,
+                                      int64_t timestamp_ms,
+                                      sensor_data_t *out_payload)
 {
+    memset(out_payload, 0, sizeof(*out_payload));
     out_payload->id_nodo = NODE_ID;
+    out_payload->sample_count = sample_count;
+    out_payload->batch_id = batch_id;
     out_payload->timestamp_ms = timestamp_ms;
-    out_payload->accel_x_g = sample->accel_x_g;
-    out_payload->accel_y_g = sample->accel_y_g;
-    out_payload->accel_z_g = sample->accel_z_g;
-    out_payload->gyro_x_dps = sample->gyro_x_dps;
-    out_payload->gyro_y_dps = sample->gyro_y_dps;
-    out_payload->gyro_z_dps = sample->gyro_z_dps;
+
+    if (sample_count > 0U) {
+        memcpy(out_payload->samples,
+               samples,
+               ((size_t)sample_count * sizeof(mpu6050_sample_t)));
+    }
 }
 
 /**
- * @brief Configura e inicia deep sleep por 10 segundos.
+ * @brief Envia un lote de muestras por ESP-NOW en un paquete compacto.
  *
- * @return void Esta funcion no retorna valor.
+ * @param samples Muestras crudas a enviar.
+ * @param sample_count Cantidad de muestras a incluir (maximo 15).
+ * @param batch_id Identificador incremental de lote.
+ * @return esp_err_t ESP_OK si el envio fue correcto, o un codigo de error en caso contrario.
  */
-static void enter_deep_sleep_10s(void)
+static esp_err_t espnow_send_batch(const mpu6050_sample_t *samples, uint8_t sample_count, uint16_t batch_id)
+{
+    esp_err_t err;
+    EventBits_t bits;
+    int64_t timestamp_ms;
+    size_t payload_bytes;
+    sensor_data_t payload;
+
+    if (samples == NULL || sample_count == 0U || sample_count > ESPNOW_BATCH_MAX_SAMPLES) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    timestamp_ms = get_unix_epoch_ms();
+    fill_sensor_payload_batch(samples, sample_count, batch_id, timestamp_ms, &payload);
+
+    payload_bytes = offsetof(sensor_data_t, samples) + ((size_t)sample_count * sizeof(mpu6050_sample_t));
+
+    ESP_LOGI(TAG,
+             "Intentando envio ESP-NOW: lote=%u muestras=%u bytes=%u ts=%" PRId64,
+             (unsigned)batch_id,
+             (unsigned)sample_count,
+             (unsigned)payload_bytes,
+             timestamp_ms);
+
+    if (s_espnow_event_group != NULL) {
+        xEventGroupClearBits(s_espnow_event_group, ESPNOW_SEND_DONE_BIT);
+    }
+
+    err = esp_now_send(s_peer_mac, (const uint8_t *)&payload, payload_bytes);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "ENVIO EXITOSO");
+    } else {
+        ESP_LOGE(TAG,
+                 "ENVIO FALLIDO lote=%u err=0x%X (%s)",
+                 (unsigned)batch_id,
+                 (unsigned)err,
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    if (s_espnow_event_group != NULL) {
+        bits = xEventGroupWaitBits(s_espnow_event_group,
+                                   ESPNOW_SEND_DONE_BIT,
+                                   pdTRUE,
+                                   pdFALSE,
+                                   pdMS_TO_TICKS(ESPNOW_SEND_TIMEOUT_MS));
+
+        if ((bits & ESPNOW_SEND_DONE_BIT) == 0) {
+            ESP_LOGW(TAG,
+                     "Timeout esperando callback ESP-NOW para lote=%u (>%ums)",
+                     (unsigned)batch_id,
+                     (unsigned)ESPNOW_SEND_TIMEOUT_MS);
+        } else if (s_last_send_status != ESP_NOW_SEND_SUCCESS) {
+            ESP_LOGW(TAG,
+                     "Gateway no confirmo entrega del lote=%u (status=FAIL)",
+                     (unsigned)batch_id);
+        }
+    }
+
+    ESP_LOGI(TAG,
+             "Batch ESP-NOW enviado: lote=%u muestras=%u bytes=%u",
+             (unsigned)batch_id,
+             (unsigned)sample_count,
+             (unsigned)payload_bytes);
+
+    for (uint8_t i = 0; i < sample_count; i++) {
+        ESP_LOGI(TAG,
+                 "L%u S%u | ACC[raw] X:%d Y:%d Z:%d | GYR[raw] X:%d Y:%d Z:%d",
+                 (unsigned)batch_id,
+                 (unsigned)i,
+                 payload.samples[i].accel_x_raw,
+                 payload.samples[i].accel_y_raw,
+                 payload.samples[i].accel_z_raw,
+                 payload.samples[i].gyro_x_raw,
+                 payload.samples[i].gyro_y_raw,
+                 payload.samples[i].gyro_z_raw);
+
+        if ((i + 1U) >= ESPNOW_LOG_SAMPLE_PREVIEW_MAX && sample_count > ESPNOW_LOG_SAMPLE_PREVIEW_MAX) {
+            ESP_LOGI(TAG,
+                     "Lote %u: se omitieron %u muestras en log para reducir ruido",
+                     (unsigned)batch_id,
+                     (unsigned)(sample_count - ESPNOW_LOG_SAMPLE_PREVIEW_MAX));
+            break;
+        }
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t espnow_send_stream_packet(const sensor_packet_t *packet)
 {
     esp_err_t err;
 
-    err = esp_sleep_enable_timer_wakeup((uint64_t)DEEP_SLEEP_SECONDS * 1000000ULL);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "No se pudo configurar wakeup timer: %s", esp_err_to_name(err));
-        return;
+    if (packet == NULL) {
+        return ESP_ERR_INVALID_ARG;
     }
 
-    // Punto critico: al entrar en deep sleep el chip reinicia en cada despertar.
-    ESP_LOGI(TAG, "Entrando en deep sleep por %d segundos", DEEP_SLEEP_SECONDS);
-    esp_deep_sleep_start();
+    err = esp_now_send(s_peer_mac, (const uint8_t *)packet, sizeof(*packet));
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "Paquete %u enviado. Timestamp: %" PRId64,
+                 (unsigned)packet->batch_id,
+                 packet->start_timestamp);
+        return ESP_OK;
+    }
+
+    ESP_LOGE(TAG,
+             "Fallo envio ESP-NOW streaming lote=%u: %s",
+             (unsigned)packet->batch_id,
+             esp_err_to_name(err));
+    return err;
+}
+
+static void streaming_task(void *arg)
+{
+    (void)arg;
+    uint16_t stream_batch_id = 0;
+
+    while (true) {
+        sensor_packet_t packet = {0};
+        int64_t start_ts_us = esp_timer_get_time();
+
+        packet.id_nodo = NODE_ID;
+        packet.start_timestamp = start_ts_us;
+        packet.batch_id = stream_batch_id;
+
+        for (int i = 0; i < STREAM_SAMPLE_COUNT; i++) {
+            mpu6050_sample_t raw = {0};
+            esp_err_t err = mpu6050_read_sample(&raw);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Lectura MPU6050 fallo: %s", esp_err_to_name(err));
+                vTaskDelay(pdMS_TO_TICKS(STREAM_SAMPLE_DELAY_MS));
+                continue;
+            }
+
+            packet.muestras[i].ax = raw.accel_x_raw;
+            packet.muestras[i].ay = raw.accel_y_raw;
+            packet.muestras[i].az = raw.accel_z_raw;
+            packet.muestras[i].gx = raw.gyro_x_raw;
+            packet.muestras[i].gy = raw.gyro_y_raw;
+            packet.muestras[i].gz = raw.gyro_z_raw;
+
+            vTaskDelay(pdMS_TO_TICKS(STREAM_SAMPLE_DELAY_MS));
+        }
+
+        (void)espnow_send_stream_packet(&packet);
+        stream_batch_id++;
+    }
 }
 
 /**
@@ -507,10 +770,16 @@ static void enter_deep_sleep_10s(void)
 void app_main(void)
 {
     esp_err_t err;
-    mpu6050_sample_t sample;
-    sensor_data_t payload;
-    int64_t timestamp_ms;
-    bool rtc_time_valid;
+    mpu6050_config_t mpu_cfg = {
+        .sda_io = 6,
+        .scl_io = 7,
+        .i2c_addr = 0x69,
+        .accel_full_scale = MPU6050_ACCEL_FS_2G,
+        .gyro_full_scale = MPU6050_GYRO_FS_250DPS,
+        .sample_rate_hz = 100,
+    };
+
+    esp_log_level_set(TAG, ESP_LOG_INFO);
 
     err = init_visual_feedback();
     if (err != ESP_OK) {
@@ -518,32 +787,21 @@ void app_main(void)
         return;
     }
 
+    err = mpu6050_init(&mpu_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "No se pudo inicializar MPU6050: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = mpu6050_enable_fifo(false);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "No se pudo deshabilitar FIFO del MPU6050: %s", esp_err_to_name(err));
+    }
+
     err = wifi_init_sta_radio_only();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "No se pudo inicializar WiFi STA: %s", esp_err_to_name(err));
         return;
-    }
-
-    rtc_time_valid = is_time_valid_from_rtc();
-    if (!rtc_time_valid) {
-        ESP_LOGI(TAG, "Hora RTC no valida, se conectara WiFi al AP para SNTP");
-
-        err = wifi_connect_sta();
-        if (err == ESP_OK) {
-            err = sync_time_with_ntp();
-            if (err != ESP_OK) {
-                ESP_LOGW(TAG, "Sincronizacion NTP no completada: %s", esp_err_to_name(err));
-            }
-
-            err = esp_wifi_disconnect();
-            if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_CONNECT) {
-                ESP_LOGW(TAG, "No se pudo desconectar del AP tras SNTP: %s", esp_err_to_name(err));
-            }
-        } else {
-            ESP_LOGW(TAG, "No se pudo conectar al AP para NTP: %s", esp_err_to_name(err));
-        }
-    } else {
-        ESP_LOGI(TAG, "Hora valida detectada en RTC, se omite conexion WiFi/NTP");
     }
 
     err = esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
@@ -558,49 +816,5 @@ void app_main(void)
         return;
     }
 
-    err = mpu6050_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "No se pudo inicializar MPU6050: %s", esp_err_to_name(err));
-        return;
-    }
-
-    err = mpu6050_read_sample(&sample);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Lectura MPU6050 fallo: %s", esp_err_to_name(err));
-        return;
-    }
-
-    timestamp_ms = get_unix_epoch_ms();
-    fill_sensor_payload(&sample, timestamp_ms, &payload);
-
-    ESP_LOGI(TAG,
-             "TS(ms):%" PRId64 " | ACC[g] X:% .3f Y:% .3f Z:% .3f | GYR[dps] X:% .3f Y:% .3f Z:% .3f",
-             payload.timestamp_ms,
-             payload.accel_x_g,
-             payload.accel_y_g,
-             payload.accel_z_g,
-             payload.gyro_x_dps,
-             payload.gyro_y_dps,
-             payload.gyro_z_dps);
-
-    err = esp_now_send(s_peer_mac, (const uint8_t *)&payload, sizeof(payload));
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Fallo envio ESP-NOW: %s", esp_err_to_name(err));
-    } else {
-        ESP_LOGI(TAG,
-                 "ESP-NOW enviado: nodo=%u bytes=%u destino=%02X:%02X:%02X:%02X:%02X:%02X",
-                 payload.id_nodo,
-                 (unsigned int)sizeof(payload),
-                 s_peer_mac[0],
-                 s_peer_mac[1],
-                 s_peer_mac[2],
-                 s_peer_mac[3],
-                 s_peer_mac[4],
-                 s_peer_mac[5]);
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(ESPNOW_POST_SEND_DELAY_MS));
-
-    // Punto critico: este sleep reduce consumo de forma drastica entre muestreos.
-    enter_deep_sleep_10s();
+    xTaskCreate(streaming_task, "streaming_task", 4096, NULL, 5, NULL);
 }
