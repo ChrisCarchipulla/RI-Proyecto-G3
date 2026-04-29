@@ -17,6 +17,7 @@
 #define MPU6050_REG_MOT_THR             0x1F
 #define MPU6050_REG_MOT_DUR             0x20
 #define MPU6050_REG_FIFO_EN             0x23
+#define MPU6050_REG_INT_PIN_CFG         0x37
 #define MPU6050_REG_INT_ENABLE          0x38
 #define MPU6050_REG_INT_STATUS          0x3A
 #define MPU6050_REG_ACCEL_XOUT_H        0x3B
@@ -422,8 +423,6 @@ esp_err_t mpu6050_setup_motion_interrupt(uint8_t threshold, uint8_t duration)
 {
     esp_err_t err;
     uint8_t accel_cfg = 0;
-    const uint8_t diag_threshold = 1;
-    const uint8_t diag_duration = 1;
 
     if (s_mpu_dev == NULL) {
         return ESP_ERR_INVALID_STATE;
@@ -434,12 +433,8 @@ esp_err_t mpu6050_setup_motion_interrupt(uint8_t threshold, uint8_t duration)
         return err;
     }
 
-    /* Modo diagnostico agresivo: maxima sensibilidad WOM (umbral y duracion minima). */
-    threshold = diag_threshold;
-    duration = diag_duration;
-
-    /* DHPF=0 para maximizar sensibilidad del WOM en diagnostico. */
-    accel_cfg = (uint8_t)((accel_cfg & 0xF8) | 0x00);
+    /* DHPF=1 (5Hz) para que WOM responda a variaciones de movimiento. */
+    accel_cfg = (uint8_t)((accel_cfg & 0xF8) | 0x01);
     err = mpu6050_write_reg(MPU6050_REG_ACCEL_CONFIG, accel_cfg);
     if (err != ESP_OK) {
         return err;
@@ -455,6 +450,12 @@ esp_err_t mpu6050_setup_motion_interrupt(uint8_t threshold, uint8_t duration)
         return err;
     }
 
+    /* INT_PIN_CFG: latch INT until read, active high, push-pull. */
+    err = mpu6050_write_reg(MPU6050_REG_INT_PIN_CFG, 0x30);
+    if (err != ESP_OK) {
+        return err;
+    }
+
     /* Bit6 de INT_ENABLE activa la interrupcion de movimiento. */
     err = mpu6050_write_reg(MPU6050_REG_INT_ENABLE, 0x40);
     if (err != ESP_OK) {
@@ -462,7 +463,7 @@ esp_err_t mpu6050_setup_motion_interrupt(uint8_t threshold, uint8_t duration)
     }
 
     ESP_LOGI(TAG,
-             "WOM configurado (diagnostico agresivo): MOT_THR=%u MOT_DUR=%u ACCEL_CONFIG=0x%02X",
+             "WOM configurado: MOT_THR=%u MOT_DUR=%u ACCEL_CONFIG=0x%02X INT_PIN_CFG=0x30",
              threshold,
              duration,
              accel_cfg);
