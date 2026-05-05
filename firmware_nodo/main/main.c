@@ -1,6 +1,5 @@
 #include <stdbool.h>
 #include <stdint.h>
-#include <string.h>
 #include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
@@ -28,11 +27,18 @@ typedef struct {
 } mpu_sample_t;
 
 typedef struct __attribute__((packed)) {
-    uint8_t id_nodo;
-    int64_t start_timestamp;
+    uint32_t start_timestamp_ms;
     uint16_t batch_id;
     mpu_sample_t muestras[STREAM_SAMPLE_COUNT];
 } sensor_packet_t;
+
+_Static_assert(sizeof(sensor_packet_t) <= ESPNOW_MAX_DATA_LEN,
+               "sensor_packet_t exceeds ESP-NOW payload limit");
+
+static uint32_t get_timestamp_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000ULL);
+}
 
 static void log_wakeup_cause(void)
 {
@@ -62,9 +68,9 @@ static esp_err_t send_packet(const sensor_packet_t *packet)
     err = espnow_handler_send((const uint8_t *)packet, sizeof(*packet));
     if (err == ESP_OK) {
         ESP_LOGI(TAG,
-                 "Paquete %u enviado. Timestamp: %" PRId64,
+                 "Paquete %u enviado. Timestamp(ms): %" PRIu32,
                  (unsigned)packet->batch_id,
-                 packet->start_timestamp);
+                 packet->start_timestamp_ms);
         return ESP_OK;
     }
 
@@ -107,8 +113,7 @@ static esp_err_t send_fifo_history(uint16_t *next_batch_id)
             return err;
         }
 
-        packet.id_nodo = NODE_ID;
-        packet.start_timestamp = esp_timer_get_time();
+        packet.start_timestamp_ms = get_timestamp_ms();
         packet.batch_id = *next_batch_id;
 
         for (uint8_t i = 0; i < chunk; i++) {
@@ -172,7 +177,7 @@ void app_main(void)
         .i2c_addr = MPU_I2C_ADDR,
         .accel_full_scale = MPU6050_ACCEL_FS_2G,
         .gyro_full_scale = MPU6050_GYRO_FS_250DPS,
-        .sample_rate_hz = 100,
+        .sample_rate_hz = MPU_SAMPLE_RATE_HZ,
     };
 
     esp_log_level_set(TAG, ESP_LOG_INFO);
@@ -237,8 +242,7 @@ void app_main(void)
                     continue;
                 }
 
-                packet.id_nodo = NODE_ID;
-                packet.start_timestamp = esp_timer_get_time();
+                packet.start_timestamp_ms = get_timestamp_ms();
                 packet.batch_id = batch_id++;
 
                 for (uint8_t i = 0; i < STREAM_SAMPLE_COUNT; i++) {

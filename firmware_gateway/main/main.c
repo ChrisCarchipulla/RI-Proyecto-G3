@@ -1,9 +1,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include <stdbool.h>
+#include <time.h>
+
+#include "config.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "freertos/portmacro.h"
 #include "esp_log.h"
 #include "esp_err.h"
@@ -14,48 +19,88 @@
 #include "esp_wifi.h"
 #include "esp_now.h"
 #include "mqtt_client.h"
+#include "lwip/apps/sntp.h"
+#include "sys/time.h"
 #include "cJSON.h"
 
-#define WIFI_SSID               "FRANKLIN-BENALCAZAR"
-#define WIFI_PASS               "0103388724"
-#define WIFI_MAX_RETRY          10
 #define WIFI_CONNECTED_BIT      BIT0
-
-#define THINGSBOARD_HOST        "mqtt.thingsboard.cloud"
-#define THINGSBOARD_PORT        8883
-#define THINGSBOARD_TOKEN       "wqnkkgmmlawl31zs4kbc"
-#define THINGSBOARD_TOPIC       "v1/devices/me/telemetry"
-#define MQTT_CLIENT_ID          "gateway-esp32"
-
-#define ESPNOW_CHANNEL          1
 
 static const char *TAG = "GATEWAY";
 
+typedef struct {
+    int16_t ax;
+    int16_t ay;
+    int16_t az;
+    int16_t gx;
+    int16_t gy;
+    int16_t gz;
+} mpu_sample_t;
+
 typedef struct __attribute__((packed)) {
-    uint8_t id_nodo;
-    int64_t timestamp_ms;
-    float accel_x_g;
-    float accel_y_g;
-    float accel_z_g;
-    float gyro_x_dps;
-    float gyro_y_dps;
-    float gyro_z_dps;
-} sensor_data_t;
+    uint32_t start_timestamp;
+    uint16_t batch_id;
+    mpu_sample_t muestras[10];
+} sensor_packet_t;
+
+typedef struct {
+    char src_mac[18];
+    sensor_packet_t packet;
+} received_packet_t;
+
+_Static_assert(sizeof(sensor_packet_t) == 126, "sensor_packet_t must match node payload size");
 
 static EventGroupHandle_t s_wifi_event_group;
 static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 static bool s_mqtt_connected = false;
-static bool s_packet_pending = false;
-static portMUX_TYPE s_packet_mux = portMUX_INITIALIZER_UNLOCKED;
-static sensor_data_t s_latest_packet;
-static uint8_t s_latest_src_mac[ESP_NOW_ETH_ALEN] = {0};
+static QueueHandle_t s_packet_queue = NULL;
+static bool s_sntp_started = false;
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
 
-static void format_mac(const uint8_t *mac, char *out, size_t out_len)
+static void mac_to_string(const uint8_t *mac, char *mac_str, size_t mac_str_len)
 {
-    snprintf(out, out_len, "%02X:%02X:%02X:%02X:%02X:%02X",
+    snprintf(mac_str, mac_str_len, "%02X:%02X:%02X:%02X:%02X:%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static int64_t get_unix_time_ms(void)
+{
+    struct timeval tv = {0};
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000LL + (int64_t)(tv.tv_usec / 1000);
+}
+
+static void start_sntp_client(void)
+{
+    if (s_sntp_started) {
+        return;
+    }
+
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, SNTP_SERVER);
+    sntp_init();
+    s_sntp_started = true;
+    ESP_LOGI(TAG, "Cliente SNTP iniciado con servidor %s", SNTP_SERVER);
+}
+
+static void wait_for_sntp_sync(uint32_t timeout_ms)
+{
+    const TickType_t poll_delay = pdMS_TO_TICKS(500);
+    TickType_t elapsed = 0;
+    const time_t valid_epoch_threshold = (time_t)1700000000;
+
+    while (elapsed < pdMS_TO_TICKS(timeout_ms)) {
+        if (time(NULL) >= valid_epoch_threshold) {
+            ESP_LOGI(TAG, "Hora NTP valida disponible");
+            break;
+        }
+        vTaskDelay(poll_delay);
+        elapsed += poll_delay;
+    }
+
+    if (time(NULL) < valid_epoch_threshold) {
+        ESP_LOGW(TAG, "SNTP aun no sincronizado, se usara la hora disponible del sistema");
+    }
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
@@ -71,6 +116,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         char ip_str[16];
         esp_ip4addr_ntoa(&event->ip_info.ip, ip_str, sizeof(ip_str));
         ESP_LOGI(TAG, "WiFi conectado, IP=%s", ip_str);
+        start_sntp_client();
+        uint8_t primary = 0;
+        wifi_second_chan_t secondary = WIFI_SECOND_CHAN_NONE;
+        if (esp_wifi_get_channel(&primary, &secondary) == ESP_OK) {
+            ESP_LOGI(TAG, "Canal WiFi actual: %u", primary);
+        }
     }
 }
 
@@ -110,6 +161,7 @@ static esp_err_t wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     esp_err_t ch_err = esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
     if (ch_err != ESP_OK) {
         ESP_LOGW(TAG, "No se pudo fijar canal ESP-NOW (%s), se mantiene canal actual", esp_err_to_name(ch_err));
@@ -126,6 +178,8 @@ static esp_err_t wifi_init_sta(void)
         ESP_LOGW(TAG, "No se obtuvo IP en el tiempo de espera; se continua en modo asincrono");
     }
 
+    wait_for_sntp_sync(10000);
+
     return ESP_OK;
 }
 
@@ -134,7 +188,7 @@ static esp_mqtt_client_handle_t mqtt_app_start(void)
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker = {
             .address = {
-                .uri = "mqtt://mqtt.thingsboard.cloud:1883"
+                .uri = "mqtt://" THINGSBOARD_HOST ":" STR(THINGSBOARD_PORT)
             }
         },
         .credentials = {
@@ -179,28 +233,57 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     }
 }
 
-static void send_json_to_thingsboard(const sensor_data_t *data, const char *src_mac)
+static void send_json_to_thingsboard(const received_packet_t *received_packet)
 {
     if (!s_mqtt_connected) {
         ESP_LOGW(TAG, "MQTT no conectado, esperando reconexion");
         return;
     }
 
-    cJSON *root = cJSON_CreateObject();
-    if (!root) {
+    const sensor_packet_t *packet = &received_packet->packet;
+    const int64_t base_timestamp_ms = get_unix_time_ms();
+
+    cJSON *root = cJSON_CreateArray();
+    if (root == NULL) {
         ESP_LOGE(TAG, "Error creando JSON");
         return;
     }
 
-    cJSON_AddStringToObject(root, "src_mac", src_mac);
-    cJSON_AddNumberToObject(root, "node_id", data->id_nodo);
-    cJSON_AddNumberToObject(root, "timestamp_ms", data->timestamp_ms);
-    cJSON_AddNumberToObject(root, "accel_x_g", data->accel_x_g);
-    cJSON_AddNumberToObject(root, "accel_y_g", data->accel_y_g);
-    cJSON_AddNumberToObject(root, "accel_z_g", data->accel_z_g);
-    cJSON_AddNumberToObject(root, "gyro_x_dps", data->gyro_x_dps);
-    cJSON_AddNumberToObject(root, "gyro_y_dps", data->gyro_y_dps);
-    cJSON_AddNumberToObject(root, "gyro_z_dps", data->gyro_z_dps);
+    for (int i = 0; i < 10; ++i) {
+        int64_t timestamp = base_timestamp_ms + (int64_t)(i * 10);
+        mpu_sample_t sample;
+        memcpy(&sample, &packet->muestras[i], sizeof(sample));
+
+        double accel_x_g = sample.ax / 16384.0;
+        double accel_y_g = sample.ay / 16384.0;
+        double accel_z_g = sample.az / 16384.0;
+        double gyro_x_dps = sample.gx / 131.0;
+        double gyro_y_dps = sample.gy / 131.0;
+        double gyro_z_dps = sample.gz / 131.0;
+
+        cJSON *entry = cJSON_CreateObject();
+        cJSON *values = cJSON_CreateObject();
+        if (entry == NULL || values == NULL) {
+            cJSON_Delete(entry);
+            cJSON_Delete(values);
+            cJSON_Delete(root);
+            ESP_LOGE(TAG, "Error creando JSON de muestra");
+            return;
+        }
+
+        cJSON_AddNumberToObject(entry, "ts", (double)timestamp);
+        cJSON_AddStringToObject(values, "src_mac", received_packet->src_mac);
+        cJSON_AddNumberToObject(values, "node_start_timestamp_ms", (double)packet->start_timestamp);
+        cJSON_AddNumberToObject(values, "batch_id", packet->batch_id);
+        cJSON_AddNumberToObject(values, "accel_x_g", accel_x_g);
+        cJSON_AddNumberToObject(values, "accel_y_g", accel_y_g);
+        cJSON_AddNumberToObject(values, "accel_z_g", accel_z_g);
+        cJSON_AddNumberToObject(values, "gyro_x_dps", gyro_x_dps);
+        cJSON_AddNumberToObject(values, "gyro_y_dps", gyro_y_dps);
+        cJSON_AddNumberToObject(values, "gyro_z_dps", gyro_z_dps);
+        cJSON_AddItemToObject(entry, "values", values);
+        cJSON_AddItemToArray(root, entry);
+    }
 
     char *payload = cJSON_PrintUnformatted(root);
     if (payload == NULL) {
@@ -223,20 +306,34 @@ static void send_json_to_thingsboard(const sensor_data_t *data, const char *src_
 
 static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len)
 {
-    if (len != sizeof(sensor_data_t)) {
-        ESP_LOGW(TAG, "Paquete invalido recibido, tamaño %d esperado %d", len, (int)sizeof(sensor_data_t));
+    if (len != sizeof(sensor_packet_t)) {
+        ESP_LOGW(TAG, "Paquete invalido recibido, tamaño %d esperado %d", len, (int)sizeof(sensor_packet_t));
         return;
     }
 
-    portENTER_CRITICAL(&s_packet_mux);
-    memcpy(&s_latest_packet, data, sizeof(sensor_data_t));
-    if (info != NULL && info->src_addr != NULL) {
-        memcpy(s_latest_src_mac, info->src_addr, ESP_NOW_ETH_ALEN);
-    } else {
-        memset(s_latest_src_mac, 0, ESP_NOW_ETH_ALEN);
+    if (s_packet_queue == NULL) {
+        return;
     }
-    s_packet_pending = true;
-    portEXIT_CRITICAL(&s_packet_mux);
+
+    if (info == NULL) {
+        ESP_LOGW(TAG, "Callback ESP-NOW sin informacion de remitente");
+        return;
+    }
+
+    received_packet_t received_packet;
+    memset(&received_packet, 0, sizeof(received_packet));
+    mac_to_string(info->src_addr, received_packet.src_mac, sizeof(received_packet.src_mac));
+    memcpy(&received_packet.packet, data, sizeof(sensor_packet_t));
+
+    ESP_LOGI(TAG, "Paquete ESP-NOW recibido de %s, len=%d", received_packet.src_mac, len);
+
+    BaseType_t higher_woken = pdFALSE;
+    if (xQueueSendFromISR(s_packet_queue, &received_packet, &higher_woken) != pdTRUE) {
+        ESP_EARLY_LOGW(TAG, "Cola llena, paquete descartado");
+    }
+    if (higher_woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
 }
 
 static esp_err_t espnow_init(void)
@@ -273,26 +370,21 @@ void app_main(void)
         ESP_LOGE(TAG, "No se pudo iniciar MQTT");
     }
 
+    s_packet_queue = xQueueCreate(20, sizeof(received_packet_t));
+    if (s_packet_queue == NULL) {
+        ESP_LOGE(TAG, "No se pudo crear la cola de paquetes");
+    }
+
     esp_err_t espnow_err = espnow_init();
     if (espnow_err != ESP_OK) {
         ESP_LOGE(TAG, "Error inicializando ESP-NOW");
     }
 
     while (true) {
-        if (s_packet_pending) {
-            portENTER_CRITICAL(&s_packet_mux);
-            sensor_data_t packet = s_latest_packet;
-            uint8_t src_mac[ESP_NOW_ETH_ALEN];
-            memcpy(src_mac, s_latest_src_mac, ESP_NOW_ETH_ALEN);
-            s_packet_pending = false;
-            portEXIT_CRITICAL(&s_packet_mux);
-
-            char mac_str[18] = {0};
-            format_mac(src_mac, mac_str, sizeof(mac_str));
-            ESP_LOGI(TAG, "Recibido paquete de %s", mac_str);
-            send_json_to_thingsboard(&packet, mac_str);
+        received_packet_t received_packet;
+        if (s_packet_queue != NULL && xQueueReceive(s_packet_queue, &received_packet, pdMS_TO_TICKS(100)) == pdTRUE) {
+            ESP_LOGI(TAG, "Recibido paquete de %s", received_packet.src_mac);
+            send_json_to_thingsboard(&received_packet);
         }
-
-        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }

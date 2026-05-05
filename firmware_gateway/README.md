@@ -23,7 +23,7 @@ Este proyecto implementa un gateway en ESP32-C6 que:
 
 ## 3) Parametros que debes cambiar antes de compilar
 
-Edita estas macros en main/main.c:
+Edita estas macros en main/config.h:
 
 - WIFI_SSID
 - WIFI_PASS
@@ -47,7 +47,7 @@ Aunque el token no depende tecnicamente del SSID, en este flujo de trabajo se re
 
 ### Plantilla rapida de configuracion
 
-Copia esta plantilla y reemplaza los valores en main/main.c antes de compilar:
+Copia esta plantilla y reemplaza los valores en main/config.h antes de compilar:
 
 ```c
 #define WIFI_SSID               "NOMBRE_DE_TU_RED"
@@ -118,14 +118,14 @@ Si aparece MQTT desconectado o Error MQTT, revisar token, host/puerto y conectiv
 4. Verificar actualizacion de campos esperados, por ejemplo:
 
 - src_mac
-- node_id
-- timestamp_ms
+- batch_id
+- node_start_timestamp_ms
 - accel_x_g, accel_y_g, accel_z_g
 - gyro_x_dps, gyro_y_dps, gyro_z_dps
 
 ## 9) Flujo recomendado al cambiar de red o entorno
 
-1. Editar en main/main.c: WIFI_SSID, WIFI_PASS y THINGSBOARD_TOKEN.
+1. Editar en main/config.h: WIFI_SSID, WIFI_PASS y THINGSBOARD_TOKEN.
 2. Ejecutar nuevamente build y flash.
 3. Abrir monitor y validar WiFi conectado y MQTT conectado.
 4. Confirmar telemetria en ThingsBoard.
