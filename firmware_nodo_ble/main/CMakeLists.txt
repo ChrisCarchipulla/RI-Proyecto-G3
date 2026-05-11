@@ -1,0 +1,16 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "ble_handler.c"
+        "mpu6050.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        esp_driver_i2c
+        esp_driver_gpio
+        bt
+        nvs_flash
+        esp_event
+        esp_timer
+        freertos
+)
